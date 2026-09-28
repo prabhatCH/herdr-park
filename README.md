@@ -76,7 +76,7 @@ herdr-park import [-y]               add Claude sessions from tabs closed before
 
 - **Park and hibernate** refuse a tab whose agent is working or waiting on an approval, and a tab whose session has no transcript yet (nothing to resume). They save the entry before closing the tab or stopping the agent, so a failure never loses a session.
 - **Hibernate** sends SIGTERM to the agent. Claude Code exits and takes its MCP servers with it. The pane is left running a small wait-for-Enter stub, which then execs the agent back into its session.
-- **Automatic capture:** herdr's `tab.closed` event carries only IDs. So the plugin keeps a snapshot of every agent pane (session, cwd, title, labels, launch flags), refreshed on agent detection, status changes, title changes and renames. When a tab or pane closes, its snapshot is saved as a parked entry.
+- **Automatic capture:** herdr's `tab.closed` event carries only IDs. So the plugin keeps a snapshot of every agent pane (session, cwd, title, labels, launch flags), refreshed on agent detection, status changes and tab renames. When a tab or pane closes, its snapshot is saved as a parked entry.
 - **State** lives in the plugin state directory (`~/.local/state/herdr/plugins/herdr-park/`):
   - `parked.json`: saved entries
   - `live.json`: the snapshot

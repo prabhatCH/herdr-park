@@ -19,10 +19,6 @@ on = "pane.agent_status_changed"
 command = ["./herdr-park", "hook", "refresh"]
 
 [[events]]
-on = "pane.updated"
-command = ["./herdr-park", "hook", "refresh"]
-
-[[events]]
 on = "tab.renamed"
 command = ["./herdr-park", "hook", "refresh"]
 
