@@ -7,7 +7,7 @@ An idle Claude Code tab still holds the `claude` process and every MCP server it
 herdr-park gives you three things:
 
 - **Park**: save the tab's agent session (session ID, cwd, title, workspace, tab label, original launch flags), then close the tab.
-- **Hibernate**: stop the agent but keep the tab, marked `zz`. Press Enter in the tab to resume.
+- **Hibernate**: stop the agent but keep the tab. The sidebar keeps a row for it, shown as `· claude · hibernated` (idle agents show `○`), and the tab is renamed `zz <label>`. Press Enter in the tab to resume.
 - **Restore**: a search picker over everything you've parked or hibernated. It matches titles, workspace, repo path and the text of your own prompts. Enter resumes the exact session with `claude --resume <id>`, in the right directory, with the flags it was started with.
 
 Tabs you close any other way are saved automatically, so an accidental close is never lost.
@@ -76,10 +76,12 @@ herdr-park import [-y]               add Claude sessions from tabs closed before
 
 - **Park and hibernate** refuse a tab whose agent is working or waiting on an approval, and a tab whose session has no transcript yet (nothing to resume). They save the entry before closing the tab or stopping the agent, so a failure never loses a session.
 - **Hibernate** sends SIGTERM to the agent. Claude Code exits and takes its MCP servers with it. The pane is left running a small wait-for-Enter stub, which then execs the agent back into its session.
+- **The hibernated badge:** herdr drops a pane's agent row when the agent exits. So the plugin claims the pane with `pane report-agent` (source `custom:herdr-park`, agent `hibernated`, state `unknown`, which renders as `·`), and relabels it with `pane report-metadata`. The claim is released before the agent starts again, because a stale claim outranks herdr's own detection. As a safety net, if a claimed pane is found running something other than the stub or a shell, the claim is dropped.
 - **Automatic capture:** herdr's `tab.closed` event carries only IDs. So the plugin keeps a snapshot of every agent pane (session, cwd, title, labels, launch flags), refreshed on agent detection, status changes and tab renames. When a tab or pane closes, its snapshot is saved as a parked entry.
+- **Multiple herdr sessions** share one list of saved tabs but keep separate snapshots, since pane and tab IDs repeat across sessions.
 - **State** lives in the plugin state directory (`~/.local/state/herdr/plugins/herdr-park/`):
   - `parked.json`: saved entries
-  - `live.json`: the snapshot
+  - `live-<session>.json`: the snapshot for each herdr session
   - `index.json`: the search cache
   - `error.log`: failures
 

@@ -15,6 +15,7 @@ Tabs closed any other way are saved automatically while the plugin is enabled.
 import contextlib
 import fcntl
 import glob
+import hashlib
 import json
 import os
 import re
@@ -29,7 +30,9 @@ HERDR = os.environ.get("HERDR_BIN_PATH") or "herdr"
 STATE_DIR = os.environ.get("HERDR_PLUGIN_STATE_DIR") or os.path.join(
     os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "herdr", "plugins", PLUGIN_ID)
 PARKED = os.path.join(STATE_DIR, "parked.json")
-LIVE = os.path.join(STATE_DIR, "live.json")
+# pane/tab ids repeat across herdr sessions, so each server gets its own snapshot
+SESSION = hashlib.sha1((os.environ.get("HERDR_SOCKET_PATH") or "default").encode()).hexdigest()[:10]
+LIVE = os.path.join(STATE_DIR, f"live-{SESSION}.json")
 INDEX = os.path.join(STATE_DIR, "index.json")
 ERROR_LOG = os.path.join(STATE_DIR, "error.log")
 LEGACY_DIR = os.path.expanduser("~/.local/share/herdr-park")
@@ -39,6 +42,9 @@ SELF = os.path.realpath(__file__)
 BUSY = {"working", "blocked"}
 SHELLS = {"zsh", "bash", "fish", "sh", "dash", "ksh", "nu", "tcsh", "elvish", "xonsh"}
 ASLEEP = "zz "
+CLAIM_SOURCE = "custom:herdr-park"   # holds a hibernated pane in the sidebar as agent "hibernated", state unknown (·)
+CLAIM_AGENT = "hibernated"
+META_SOURCE = "herdr-park"
 GONE_TTL = 600          # keep closed panes in the live snapshot this long, so a late tab.closed still finds them
 PROMPT_CAP = 40000      # per-session prompt text kept in the search index
 
@@ -166,6 +172,28 @@ def agent_process(pane_id, kind):
     return None, [kind]
 
 
+def real_agents():
+    """Agents herdr detected, without the placeholder rows we hold for hibernated panes."""
+    return [a for a in herdr("agent", "list")["agents"] if a["agent"] != CLAIM_AGENT]
+
+
+def claim(pane_id, kind):
+    """Keep a hibernated pane in the sidebar with its own label and the unknown-state glyph."""
+    with contextlib.suppress(HerdrError):
+        herdr("pane", "report-agent", pane_id, "--source", CLAIM_SOURCE, "--agent", CLAIM_AGENT, "--state", "unknown")
+        herdr("pane", "report-metadata", pane_id, "--source", META_SOURCE, "--display-agent", f"{kind} · hibernated",
+              "--state-label", "unknown=hibernated")
+
+
+def release(pane_id):
+    """Must run before the agent starts again: a stale claim outranks herdr's own detection."""
+    if not pane_id:
+        return
+    with contextlib.suppress(HerdrError):
+        herdr("pane", "release-agent", pane_id, "--source", CLAIM_SOURCE, "--agent", CLAIM_AGENT)
+        herdr("pane", "report-metadata", pane_id, "--source", META_SOURCE, "--clear-display-agent", "--clear-state-labels")
+
+
 def transcript_paths():
     return {os.path.basename(p)[:-6]: p for p in glob.glob(os.path.join(CLAUDE_DIR, "projects", "*", "*.jsonl"))}
 
@@ -213,7 +241,7 @@ def resume_argv(agent):
 def describe(tab_id):
     tab = herdr("tab", "get", tab_id)["tab"]
     ws = herdr("workspace", "get", tab["workspace_id"])["workspace"]
-    agents = [a for a in herdr("agent", "list")["agents"] if a["tab_id"] == tab_id]
+    agents = [a for a in real_agents() if a["tab_id"] == tab_id]
     panes = [p for p in herdr("pane", "list", "--workspace", tab["workspace_id"])["panes"] if p.get("tab_id") == tab_id]
     return tab, ws, agents, panes
 
@@ -284,6 +312,7 @@ def hibernate_tab(tab_id, force=False):
     for r in records:
         wait_for_shell(r["pane_id"])
         herdr("pane", "run", r["pane_id"], shlex.join([SELF, "wake", r["session_id"]]))
+        claim(r["pane_id"], r["agent"])
     if not label.startswith(ASLEEP):
         herdr("tab", "rename", tab_id, ASLEEP + label)
     return name, freed
@@ -292,8 +321,7 @@ def hibernate_tab(tab_id, force=False):
 def wait_for_shell(pane_id, timeout=15):
     deadline = time.time() + timeout
     while time.time() < deadline:
-        procs = foreground(pane_id).get("foreground_processes", [])
-        if procs and all(os.path.basename(p.get("argv0") or p.get("name") or "").lstrip("-") in SHELLS for p in procs):
+        if is_shell(foreground(pane_id).get("foreground_processes", [])):
             return
         time.sleep(0.3)
     raise HerdrError(f"{pane_id}: agent did not exit within {timeout}s")
@@ -313,7 +341,7 @@ def cmd_hibernate(args):
 def idle_tabs():
     here = {os.environ.get("HERDR_TAB_ID"), focused_tab()}
     by_tab = {}
-    for a in herdr("agent", "list")["agents"]:
+    for a in real_agents():
         by_tab.setdefault(a["tab_id"], []).append(a)
     return {t: ag for t, ag in by_tab.items() if t not in here and all(a["agent_status"] not in BUSY for a in ag)}
 
@@ -349,12 +377,16 @@ def cmd_wake(args):
     agent = next((a for e in ([entry] if entry else []) for a in e["agents"] if a["session_id"] == sid), None)
     title = (agent or {}).get("title") or sid[:8]
     print(f"\n  hibernated: {title}\n  press Enter to resume (ctrl-c leaves a plain shell)\n")
+    pane_id = os.environ.get("HERDR_PANE_ID")
     try:
         input()
     except (EOFError, KeyboardInterrupt):
+        release(pane_id)  # a plain shell now; the picker can still resume it here
+        print(f"left as a shell; resume with: {shlex.join(resume_argv(agent) if agent else ['claude', '--resume', sid])}")
         return
     argv = resume_argv(agent) if agent else ["claude", "--resume", sid]
-    finish_wake(sid, os.environ.get("HERDR_PANE_ID"))
+    release(pane_id)
+    finish_wake(sid, pane_id)
     os.execvp(argv[0], argv)
 
 
@@ -391,6 +423,19 @@ def target_workspace(e):
     return created["workspace"]["workspace_id"], created
 
 
+def is_shell(procs):
+    return bool(procs) and all(os.path.basename(p.get("argv0") or p.get("name") or "").lstrip("-") in SHELLS for p in procs)
+
+
+def is_stub(procs):
+    return any("herdr-park" in c and " wake " in f" {c} " for c in (" ".join(p.get("argv") or [p.get("argv0") or ""]) for p in procs))
+
+
+def stub_or_shell(pane_id):
+    procs = foreground(pane_id).get("foreground_processes", [])
+    return is_stub(procs) or is_shell(procs)
+
+
 def wake_in_place(e, focus):
     """A hibernated tab that still exists: nudge its wake stub, or resume in its shell. False if it's gone."""
     h = e["hibernated"]
@@ -399,10 +444,10 @@ def wake_in_place(e, focus):
         return False
     for pane_id, agent in zip(h["pane_ids"], e["agents"]):
         procs = foreground(pane_id).get("foreground_processes", [])
-        cmdlines = [" ".join(p.get("argv") or [p.get("argv0") or ""]) for p in procs]
-        if any("herdr-park" in c and " wake " in f" {c} " for c in cmdlines):
+        if is_stub(procs):
             herdr("pane", "send-keys", pane_id, "enter")
-        elif procs and all(os.path.basename(p.get("argv0") or p.get("name") or "").lstrip("-") in SHELLS for p in procs):
+        elif is_shell(procs):
+            release(pane_id)
             herdr("pane", "run", pane_id, shlex.join(resume_argv(agent)))
             finish_wake(agent["session_id"], pane_id)
         else:
@@ -457,7 +502,11 @@ def cmd_restore(args):
 
 def refresh_live():
     """Snapshot every agent pane with a session, so a later tab.closed (which carries only ids) can be saved."""
-    agents = herdr("agent", "list")["agents"]
+    everything = herdr("agent", "list")["agents"]
+    for a in everything:
+        if a["agent"] == CLAIM_AGENT and not stub_or_shell(a["pane_id"]):
+            release(a["pane_id"])  # the agent came back without the wake stub; don't hide it
+    agents = [a for a in everything if a["agent"] != CLAIM_AGENT]
     ws = {w["workspace_id"]: w.get("label") for w in herdr("workspace", "list")["workspaces"]}
     tabs = {t["tab_id"]: t.get("label") for t in herdr("tab", "list")["tabs"]}
     t = time.time()
@@ -481,6 +530,9 @@ def refresh_live():
                 if t - rec["gone_at"] > GONE_TTL:
                     del live[pane_id]
         write_json(LIVE, live)
+        for other in glob.glob(os.path.join(STATE_DIR, "live-*.json")):
+            if other != LIVE and t - os.path.getmtime(other) > 7 * 86400:
+                os.remove(other)  # snapshot of a herdr session that no longer runs
 
 
 def capture(match):
@@ -582,7 +634,7 @@ def guess_workspace(cwd, live_agents, labels):
 
 def cmd_import(args):
     since = herdr_started_at()
-    live = herdr("agent", "list")["agents"]
+    live = real_agents()
     labels = {w["workspace_id"]: w.get("label") for w in herdr("workspace", "list")["workspaces"]}
     known = {a.get("session_id") for e in load() for a in e["agents"]}
     known |= {(a.get("agent_session") or {}).get("value") for a in live}
