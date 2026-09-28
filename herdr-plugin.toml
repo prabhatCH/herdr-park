@@ -1,0 +1,71 @@
+id = "herdr-park"
+name = "Park"
+version = "0.1.0"
+min_herdr_version = "0.9.1"
+description = "Free the memory of idle agent tabs: park (close + save) or hibernate (keep the tab) and resume the exact session later from a searchable picker"
+platforms = ["linux", "macos"]
+
+# Keep a snapshot of every agent tab so tabs closed by hand are saved too
+# (tab.closed only carries ids, so the details have to be captured earlier).
+[[startup]]
+command = ["./herdr-park", "hook", "refresh"]
+
+[[events]]
+on = "pane.agent_detected"
+command = ["./herdr-park", "hook", "refresh"]
+
+[[events]]
+on = "pane.agent_status_changed"
+command = ["./herdr-park", "hook", "refresh"]
+
+[[events]]
+on = "pane.updated"
+command = ["./herdr-park", "hook", "refresh"]
+
+[[events]]
+on = "tab.renamed"
+command = ["./herdr-park", "hook", "refresh"]
+
+[[events]]
+on = "tab.closed"
+command = ["./herdr-park", "hook", "tab-closed"]
+
+[[events]]
+on = "pane.closed"
+command = ["./herdr-park", "hook", "pane-closed"]
+
+[[actions]]
+id = "restore"
+title = "Restore a parked or hibernated tab"
+command = ["./herdr-park", "popup", "picker"]
+
+[[actions]]
+id = "park"
+title = "Park this tab (save the session, close the tab)"
+command = ["./herdr-park", "popup", "park"]
+
+[[actions]]
+id = "hibernate"
+title = "Hibernate this tab (stop the agent, keep the tab)"
+command = ["./herdr-park", "hibernate"]
+
+[[actions]]
+id = "hibernate-idle"
+title = "Hibernate every idle agent tab"
+command = ["./herdr-park", "hibernate-idle", "-y"]
+
+[[panes]]
+id = "picker"
+title = "Restore"
+placement = "popup"
+width = "85%"
+height = "70%"
+command = ["./herdr-park", "restore", "--popup"]
+
+[[panes]]
+id = "park"
+title = "Park"
+placement = "popup"
+width = "70%"
+height = 8
+command = ["./herdr-park", "park", "--popup"]

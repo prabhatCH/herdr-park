@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+*.tmp
+.DS_Store
+# state never lives in the repo, but guard against copying it in
+parked.json
+live.json
+index.json
+error.log

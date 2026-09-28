@@ -1,0 +1,885 @@
+#!/usr/bin/env python3
+"""herdr-park: free the memory of idle agent tabs without losing their sessions.
+
+  herdr-park park [TAB_ID] [-y]        save the tab's agent sessions, then close the tab
+  herdr-park hibernate [TAB_ID]        stop the agents but keep the tab; Enter in the tab resumes
+  herdr-park park-idle [-y]            park every idle agent tab except the focused one
+  herdr-park hibernate-idle [-y]       hibernate every idle agent tab except the focused one
+  herdr-park restore [N|TEXT]          search picker (or restore entry N / the one match for TEXT)
+  herdr-park list                      saved and hibernated tabs
+  herdr-park drop N                    forget a saved entry
+  herdr-park import [-y]               add Claude sessions from tabs closed before herdr-park was installed
+
+Tabs closed any other way are saved automatically while the plugin is enabled.
+"""
+import contextlib
+import fcntl
+import glob
+import json
+import os
+import re
+import shlex
+import signal
+import subprocess
+import sys
+import time
+
+PLUGIN_ID = "herdr-park"
+HERDR = os.environ.get("HERDR_BIN_PATH") or "herdr"
+STATE_DIR = os.environ.get("HERDR_PLUGIN_STATE_DIR") or os.path.join(
+    os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "herdr", "plugins", PLUGIN_ID)
+PARKED = os.path.join(STATE_DIR, "parked.json")
+LIVE = os.path.join(STATE_DIR, "live.json")
+INDEX = os.path.join(STATE_DIR, "index.json")
+ERROR_LOG = os.path.join(STATE_DIR, "error.log")
+LEGACY_DIR = os.path.expanduser("~/.local/share/herdr-park")
+CLAUDE_DIR = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+SELF = os.path.realpath(__file__)
+
+BUSY = {"working", "blocked"}
+SHELLS = {"zsh", "bash", "fish", "sh", "dash", "ksh", "nu", "tcsh", "elvish", "xonsh"}
+ASLEEP = "zz "
+GONE_TTL = 600          # keep closed panes in the live snapshot this long, so a late tab.closed still finds them
+PROMPT_CAP = 40000      # per-session prompt text kept in the search index
+
+
+class HerdrError(Exception):
+    pass
+
+
+# ---------------------------------------------------------------- plumbing
+
+def herdr(*args):
+    p = subprocess.run([HERDR, *args], capture_output=True, text=True)
+    if p.returncode != 0:
+        raise HerdrError(f"herdr {' '.join(args)}: {(p.stderr or p.stdout).strip()}")
+    return json.loads(p.stdout)["result"] if p.stdout.strip() else {}
+
+
+def read_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def write_json(path, data):
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=1)
+    os.replace(tmp, path)
+
+
+def ensure_state():
+    os.makedirs(STATE_DIR, exist_ok=True)
+    legacy = os.path.join(LEGACY_DIR, "parked.json")
+    if not os.path.exists(PARKED) and os.path.exists(legacy):
+        os.replace(legacy, PARKED)
+
+
+@contextlib.contextmanager
+def locked():
+    """Event hooks run concurrently; every read-modify-write of state goes through this."""
+    ensure_state()
+    with open(os.path.join(STATE_DIR, ".lock"), "w") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        yield
+
+
+@contextlib.contextmanager
+def store():
+    with locked():
+        entries = read_json(PARKED, [])
+        yield entries
+        write_json(PARKED, entries)
+
+
+def load():
+    ensure_state()
+    return read_json(PARKED, [])
+
+
+def key(entry):
+    return entry["agents"][0].get("session_id")
+
+
+def now():
+    return time.strftime("%Y-%m-%d %H:%M")
+
+
+def context():
+    try:
+        return json.loads(os.environ.get("HERDR_PLUGIN_CONTEXT_JSON") or "{}")
+    except ValueError:
+        return {}
+
+
+def notify(title, body=""):
+    try:
+        herdr("notification", "show", title, *(["--body", body] if body else []))
+    except HerdrError:
+        pass
+    print(title + (f": {body}" if body else ""))
+
+
+def confirm(msg, assume_yes):
+    if assume_yes:
+        return True
+    if not sys.stdin.isatty():
+        print(f"{msg} -- not a tty, pass -y to confirm")
+        return False
+    return input(f"{msg} [Y/n] ").strip().lower() in ("", "y", "yes")
+
+
+# ---------------------------------------------------------------- herdr state
+
+def focused_tab():
+    """The tab the user is looking at, from the most specific source available."""
+    if os.environ.get("HERDR_PARK_TAB"):
+        return os.environ["HERDR_PARK_TAB"]
+    active = os.environ.get("HERDR_ACTIVE_PANE_ID")
+    if active:
+        with contextlib.suppress(HerdrError, KeyError):
+            return herdr("pane", "get", active)["pane"]["tab_id"]
+    if context().get("tab_id"):
+        return context()["tab_id"]
+    ws = next((w for w in herdr("workspace", "list")["workspaces"] if w["focused"]), None)
+    if not ws:
+        raise HerdrError("no focused workspace")
+    tab = next((t for t in herdr("tab", "list", "--workspace", ws["workspace_id"])["tabs"] if t["focused"]), None)
+    return tab["tab_id"] if tab else ws["active_tab_id"]
+
+
+def foreground(pane_id):
+    try:
+        return herdr("pane", "process-info", "--pane", pane_id)["process_info"]
+    except HerdrError:
+        return {}
+
+
+def agent_process(pane_id, kind):
+    for p in foreground(pane_id).get("foreground_processes", []):
+        argv = p.get("argv") or [p.get("argv0") or ""]
+        if os.path.basename(argv[0]) == kind:
+            return p, argv
+    return None, [kind]
+
+
+def transcript_paths():
+    return {os.path.basename(p)[:-6]: p for p in glob.glob(os.path.join(CLAUDE_DIR, "projects", "*", "*.jsonl"))}
+
+
+def resumable(agent, paths=None):
+    """Claude only writes a transcript after the first prompt; without one there is nothing to resume."""
+    if agent["agent"] != "claude":
+        return bool(agent.get("session_id"))
+    paths = transcript_paths() if paths is None else paths
+    return agent.get("session_id") in paths
+
+
+def agent_record(a, argv):
+    return {
+        "agent": a["agent"],
+        "session_id": (a.get("agent_session") or {}).get("value"),
+        "title": a.get("terminal_title_stripped") or "",
+        "cwd": a.get("foreground_cwd") or a.get("cwd"),
+        "argv": argv,
+        "pane_id": a["pane_id"],
+    }
+
+
+def resume_argv(agent):
+    kind, sid = agent["agent"], agent.get("session_id")
+    if not sid:
+        return None
+    argv = list(agent.get("argv") or [kind])
+    if kind == "claude":
+        # drop any earlier --resume/--continue so we land on exactly this session
+        out, skip = [], False
+        for a in argv[1:]:
+            if skip:
+                skip = False
+            elif a in ("--resume", "-r"):
+                skip = True
+            elif a not in ("--continue", "-c") and not a.startswith("--resume="):
+                out.append(a)
+        return ["claude", *out, "--resume", sid]
+    if kind == "codex":
+        return ["codex", "resume", sid]
+    return None
+
+
+def describe(tab_id):
+    tab = herdr("tab", "get", tab_id)["tab"]
+    ws = herdr("workspace", "get", tab["workspace_id"])["workspace"]
+    agents = [a for a in herdr("agent", "list")["agents"] if a["tab_id"] == tab_id]
+    panes = [p for p in herdr("pane", "list", "--workspace", tab["workspace_id"])["panes"] if p.get("tab_id") == tab_id]
+    return tab, ws, agents, panes
+
+
+def new_entry(ws_id, ws_label, tab_label, agents, source, **extra):
+    return {"parked_at": now(), "source": source, "workspace_id": ws_id, "workspace_label": ws_label,
+            "tab_label": tab_label, "agents": agents, **extra}
+
+
+def check_tab(tab_id, action, force=False):
+    """Return (tab, ws, agents, note) for a tab that is safe to park/hibernate, or raise with the reason."""
+    tab, ws, agents, panes = describe(tab_id)
+    name = f"{ws.get('label')} / {tab.get('label')}"
+    if not agents:
+        raise HerdrError(f"{name}: no agent in this tab")
+    busy = [a for a in agents if a["agent_status"] in BUSY]
+    if busy and not force:
+        raise HerdrError(f"{name}: agent is {busy[0]['agent_status']}, not {action}ing it mid-turn")
+    paths = transcript_paths()
+    records = [agent_record(a, agent_process(a["pane_id"], a["agent"])[1]) for a in agents]
+    stuck = [r for r in records if not r["session_id"] or not resumable(r, paths)]
+    if stuck:
+        raise HerdrError(f"{name}: {stuck[0]['pane_id']} has no resumable session yet")
+    extra = len(panes) - len(agents)
+    note = f" (+{extra} non-agent pane(s) not kept)" if extra > 0 and action == "park" else ""
+    return tab, ws, records, name, note
+
+
+# ---------------------------------------------------------------- park / hibernate
+
+def park_tab(tab_id, assume_yes=False, force=False):
+    tab, ws, records, name, note = check_tab(tab_id, "park", force)
+    titles = ", ".join(r["title"] or r["agent"] for r in records)
+    if not confirm(f"park {name}: {titles}{note}?", assume_yes):
+        return False
+    with store() as entries:
+        known = {key(e) for e in entries}
+        if records[0]["session_id"] not in known:
+            entries.append(new_entry(ws["workspace_id"], ws.get("label"), tab.get("label"), records, "park"))
+    herdr("tab", "close", tab_id)  # after the save, so a failed close never loses the session
+    print(f"parked {name}")
+    return True
+
+
+def rss_mb(pane_id):
+    """Resident memory of everything in the pane's foreground job (the agent plus the MCP servers it spawned)."""
+    pids = [str(p["pid"]) for p in foreground(pane_id).get("foreground_processes", []) if p.get("pid")]
+    if not pids:
+        return 0
+    out = subprocess.run(["ps", "-o", "rss=", "-p", ",".join(pids)], capture_output=True, text=True).stdout
+    return sum(int(x) for x in out.split() if x.isdigit()) // 1024
+
+
+def hibernate_tab(tab_id, force=False):
+    tab, ws, records, name, _ = check_tab(tab_id, "hibernate", force)
+    label = tab.get("label") or records[0]["title"][:30]
+    with store() as entries:
+        entries[:] = [e for e in entries if key(e) != records[0]["session_id"]]
+        entries.append(new_entry(ws["workspace_id"], ws.get("label"), label, records, "hibernate",
+                                 hibernated={"tab_id": tab_id, "pane_ids": [r["pane_id"] for r in records]}))
+    freed = 0
+    for r in records:
+        proc, _ = agent_process(r["pane_id"], r["agent"])
+        if not proc:
+            continue
+        freed += rss_mb(r["pane_id"])
+        os.kill(proc["pid"], signal.SIGTERM)
+    for r in records:
+        wait_for_shell(r["pane_id"])
+        herdr("pane", "run", r["pane_id"], shlex.join([SELF, "wake", r["session_id"]]))
+    if not label.startswith(ASLEEP):
+        herdr("tab", "rename", tab_id, ASLEEP + label)
+    return name, freed
+
+
+def wait_for_shell(pane_id, timeout=15):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        procs = foreground(pane_id).get("foreground_processes", [])
+        if procs and all(os.path.basename(p.get("argv0") or p.get("name") or "").lstrip("-") in SHELLS for p in procs):
+            return
+        time.sleep(0.3)
+    raise HerdrError(f"{pane_id}: agent did not exit within {timeout}s")
+
+
+def cmd_park(args):
+    pos = [a for a in args if not a.startswith("-")]
+    park_tab(pos[0] if pos else focused_tab(), "-y" in args, "--force" in args)
+
+
+def cmd_hibernate(args):
+    pos = [a for a in args if not a.startswith("-")]
+    name, freed = hibernate_tab(pos[0] if pos else focused_tab(), "--force" in args)
+    notify(f"hibernated {name}", f"freed ~{freed} MB; press Enter in the tab to resume" if freed else "")
+
+
+def idle_tabs():
+    here = {os.environ.get("HERDR_TAB_ID"), focused_tab()}
+    by_tab = {}
+    for a in herdr("agent", "list")["agents"]:
+        by_tab.setdefault(a["tab_id"], []).append(a)
+    return {t: ag for t, ag in by_tab.items() if t not in here and all(a["agent_status"] not in BUSY for a in ag)}
+
+
+def cmd_bulk(action, args):
+    tabs = idle_tabs()
+    if not tabs:
+        print("nothing idle")
+        return
+    for t, ag in tabs.items():
+        print(f"  {t:8} {', '.join(a.get('terminal_title_stripped') or a['agent'] for a in ag)}")
+    if not confirm(f"{action} these {len(tabs)} tabs?", "-y" in args):
+        return
+    freed = 0
+    for t in tabs:
+        try:
+            if action == "park":
+                park_tab(t, assume_yes=True)
+            else:
+                name, mb = hibernate_tab(t)
+                freed += mb
+                print(f"hibernated {name} (~{mb} MB)")
+        except HerdrError as e:
+            print(f"skip {e}")
+    if action == "hibernate":
+        notify(f"hibernated {len(tabs)} tabs", f"freed ~{freed} MB")
+
+
+def cmd_wake(args):
+    """Runs inside a hibernated pane: wait for Enter, then exec the agent back into its session."""
+    sid = args[0]
+    entry = next((e for e in load() if key(e) == sid), None)
+    agent = next((a for e in ([entry] if entry else []) for a in e["agents"] if a["session_id"] == sid), None)
+    title = (agent or {}).get("title") or sid[:8]
+    print(f"\n  hibernated: {title}\n  press Enter to resume (ctrl-c leaves a plain shell)\n")
+    try:
+        input()
+    except (EOFError, KeyboardInterrupt):
+        return
+    argv = resume_argv(agent) if agent else ["claude", "--resume", sid]
+    finish_wake(sid, os.environ.get("HERDR_PANE_ID"))
+    os.execvp(argv[0], argv)
+
+
+def finish_wake(sid, pane_id):
+    """This pane's agent is back: forget it, and once the whole tab is awake drop the entry and the zz marker."""
+    rename = None
+    with store() as entries:
+        e = next((x for x in entries if key(x) == sid and x.get("hibernated")), None)
+        if e:
+            left = [p for p in e["hibernated"]["pane_ids"] if p != pane_id]
+            if left:
+                e["hibernated"]["pane_ids"] = left
+            else:
+                entries.remove(e)
+                rename = (e["hibernated"]["tab_id"], e["tab_label"])
+    if rename:
+        with contextlib.suppress(HerdrError):
+            herdr("tab", "rename", *rename)
+
+
+# ---------------------------------------------------------------- restore
+
+def target_workspace(e):
+    workspaces = herdr("workspace", "list")["workspaces"]
+    if not e.get("workspace_label"):
+        return next((w["workspace_id"] for w in workspaces if w["focused"]), workspaces[0]["workspace_id"]), None
+    for w in workspaces:
+        if w["workspace_id"] == e.get("workspace_id") and w.get("label") == e["workspace_label"]:
+            return w["workspace_id"], None
+    for w in workspaces:
+        if w.get("label") == e["workspace_label"]:
+            return w["workspace_id"], None
+    created = herdr("workspace", "create", "--cwd", e["agents"][0]["cwd"], "--label", e["workspace_label"], "--no-focus")
+    return created["workspace"]["workspace_id"], created
+
+
+def wake_in_place(e, focus):
+    """A hibernated tab that still exists: nudge its wake stub, or resume in its shell. False if it's gone."""
+    h = e["hibernated"]
+    live = {p["pane_id"] for p in herdr("pane", "list")["panes"]}
+    if not all(p in live for p in h["pane_ids"]):
+        return False
+    for pane_id, agent in zip(h["pane_ids"], e["agents"]):
+        procs = foreground(pane_id).get("foreground_processes", [])
+        cmdlines = [" ".join(p.get("argv") or [p.get("argv0") or ""]) for p in procs]
+        if any("herdr-park" in c and " wake " in f" {c} " for c in cmdlines):
+            herdr("pane", "send-keys", pane_id, "enter")
+        elif procs and all(os.path.basename(p.get("argv0") or p.get("name") or "").lstrip("-") in SHELLS for p in procs):
+            herdr("pane", "run", pane_id, shlex.join(resume_argv(agent)))
+            finish_wake(agent["session_id"], pane_id)
+        else:
+            return False
+    if focus:
+        herdr("tab", "focus", h["tab_id"])
+    return True
+
+
+def restore(e, focus=True):
+    if e.get("hibernated") and wake_in_place(e, focus):
+        print(f"woke {e['workspace_label']} / {e['tab_label']}")
+        return
+    ws_id, created = target_workspace(e)
+    first = e["agents"][0]
+    label = (e.get("tab_label") or "").removeprefix(ASLEEP)
+    if created:
+        pane_id, tab_id = created["root_pane"]["pane_id"], created["tab"]["tab_id"]
+        if label:
+            herdr("tab", "rename", tab_id, label)
+    else:
+        opts = ["tab", "create", "--workspace", ws_id, "--cwd", first["cwd"], "--focus" if focus else "--no-focus"]
+        created = herdr(*opts, *(["--label", label] if label else []))
+        pane_id, tab_id = created["root_pane"]["pane_id"], created["tab"]["tab_id"]
+    for n, a in enumerate(e["agents"]):
+        if n:
+            pane_id = herdr("pane", "split", pane_id, "--direction", "right", "--cwd", a["cwd"], "--no-focus")["pane"]["pane_id"]
+        argv = resume_argv(a)
+        if argv:
+            herdr("pane", "run", pane_id, shlex.join(argv))
+        else:
+            print(f"no resume recipe for {a['agent']}; session {a.get('session_id')} in {a['cwd']}")
+    with store() as entries:
+        entries[:] = [x for x in entries if key(x) != key(e)]
+    if focus:
+        herdr("tab", "focus", tab_id)
+    print(f"restored {e['workspace_label']} / {label}")
+
+
+def cmd_restore(args):
+    focus = "--no-focus" not in args
+    query = " ".join(a for a in args if not a.startswith("--"))
+    entries = load()
+    if not entries:
+        raise HerdrError("nothing saved yet")
+    idx = pick(entries, query)
+    if idx is not None:
+        restore(entries[idx], focus)
+
+
+# ---------------------------------------------------------------- automatic capture (event hooks)
+
+def refresh_live():
+    """Snapshot every agent pane with a session, so a later tab.closed (which carries only ids) can be saved."""
+    agents = herdr("agent", "list")["agents"]
+    ws = {w["workspace_id"]: w.get("label") for w in herdr("workspace", "list")["workspaces"]}
+    tabs = {t["tab_id"]: t.get("label") for t in herdr("tab", "list")["tabs"]}
+    t = time.time()
+    with locked():
+        live = read_json(LIVE, {})
+        seen = set()
+        for a in agents:
+            sid = (a.get("agent_session") or {}).get("value")
+            if not sid:
+                continue
+            prev = live.get(a["pane_id"], {})
+            argv = prev.get("argv") if prev.get("session_id") == sid else None
+            rec = agent_record(a, argv or agent_process(a["pane_id"], a["agent"])[1])
+            rec.update(tab_id=a["tab_id"], workspace_id=a["workspace_id"], workspace_label=ws.get(a["workspace_id"]),
+                       tab_label=tabs.get(a["tab_id"]), seen_at=t)
+            live[a["pane_id"]] = rec
+            seen.add(a["pane_id"])
+        for pane_id, rec in list(live.items()):
+            if pane_id not in seen:
+                rec.setdefault("gone_at", t)
+                if t - rec["gone_at"] > GONE_TTL:
+                    del live[pane_id]
+        write_json(LIVE, live)
+
+
+def capture(match):
+    """Save the live-snapshot panes that `match` selects; convert a hibernated entry whose tab just closed."""
+    with locked():
+        live = read_json(LIVE, {})
+        recs = [r for p, r in live.items() if match(p, r)]
+        for r in recs:
+            live.pop(r["pane_id"], None)
+        write_json(LIVE, live)
+        entries = read_json(PARKED, [])
+        for e in entries:
+            h = e.get("hibernated")
+            if h and any(match(p, {"tab_id": h["tab_id"], "pane_id": p}) for p in h["pane_ids"]):
+                e.pop("hibernated")
+                e["tab_label"] = (e.get("tab_label") or "").removeprefix(ASLEEP)
+                e["parked_at"], e["source"] = now(), "auto"
+        known = {a.get("session_id") for e in entries for a in e["agents"]}
+        paths = transcript_paths()
+        keep = [r for r in recs if r["session_id"] not in known and resumable(r, paths)]
+        if keep:
+            fields = ("agent", "session_id", "title", "cwd", "argv", "pane_id")
+            entries.append(new_entry(keep[0]["workspace_id"], keep[0]["workspace_label"], keep[0]["tab_label"],
+                                     [{k: r.get(k) for k in fields} for r in keep], "auto"))
+        write_json(PARKED, entries)
+
+
+def cmd_hook(args):
+    event = json.loads(os.environ.get("HERDR_PLUGIN_EVENT_JSON") or "{}").get("data", {})
+    if args[0] == "refresh":
+        refresh_live()
+    elif args[0] == "tab-closed" and event.get("tab_id"):
+        capture(lambda pane_id, r: r.get("tab_id") == event["tab_id"])
+    elif args[0] == "pane-closed" and event.get("pane_id"):
+        capture(lambda pane_id, r: pane_id == event["pane_id"])
+
+
+# ---------------------------------------------------------------- import (tabs closed before installing)
+
+def herdr_started_at():
+    """First server start in herdr's log; older sessions never lived in a herdr tab."""
+    log = os.path.join(os.path.dirname(os.environ.get("HERDR_SOCKET_PATH") or os.path.expanduser("~/.config/herdr/x")),
+                       "herdr-server.log")
+    with contextlib.suppress(OSError, IndexError, ValueError):
+        with open(log) as f:
+            return parse_utc(f.readline().split()[0])
+    return 0
+
+
+def parse_utc(stamp):
+    return time.mktime(time.strptime(stamp[:19], "%Y-%m-%dT%H:%M:%S")) - time.timezone
+
+
+def is_prompt(d):
+    c = (d.get("message") or {}).get("content")
+    return (d.get("type") == "user" and not d.get("isMeta") and isinstance(c, str)
+            and not c.lstrip().startswith(("<command-", "<local-command")))
+
+
+def read_transcript(path):
+    info = {"title": None, "ai_title": None, "cwd": None, "entrypoint": None, "last": None, "first_prompt": None, "prompts": 0}
+    with open(path, errors="ignore") as fh:
+        for line in fh:
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            t = d.get("type")
+            if t == "custom-title":
+                info["title"] = d.get("customTitle") or info["title"]
+            elif t == "ai-title":
+                info["ai_title"] = d.get("aiTitle") or info["ai_title"]
+            elif is_prompt(d):
+                info["prompts"] += 1
+                info["first_prompt"] = info["first_prompt"] or " ".join(d["message"]["content"].split())[:60]
+            info["cwd"] = d.get("cwd") or info["cwd"]
+            info["entrypoint"] = d.get("entrypoint") or info["entrypoint"]
+            info["last"] = d.get("timestamp") or info["last"]
+    info["title"] = info["title"] or info["ai_title"] or info["first_prompt"] or ""
+    return info
+
+
+def guess_workspace(cwd, live_agents, labels):
+    """The workspace of the open agent whose cwd shares the deepest path with this one (at least its parent dir)."""
+    best, depth = None, 0
+    home = os.path.expanduser("~")
+    for a in live_agents:
+        other = a.get("cwd") or ""
+        common = os.path.commonpath([cwd, other]) if other else ""
+        if common in ("", "/", home):
+            continue
+        if common not in (cwd, other, os.path.dirname(cwd), os.path.dirname(other)):
+            continue
+        d = common.count(os.sep) + (100 if cwd == other else 0)
+        if d > depth:
+            best, depth = labels.get(a["workspace_id"]), d
+    return best
+
+
+def cmd_import(args):
+    since = herdr_started_at()
+    live = herdr("agent", "list")["agents"]
+    labels = {w["workspace_id"]: w.get("label") for w in herdr("workspace", "list")["workspaces"]}
+    known = {a.get("session_id") for e in load() for a in e["agents"]}
+    known |= {(a.get("agent_session") or {}).get("value") for a in live}
+    flags = [tuple(x for x in agent_process(a["pane_id"], "claude")[1][1:]
+                   if x not in ("--resume", "-r", "--continue", "-c") and not re.fullmatch(r"[0-9a-f-]{36}", x))
+             for a in live if a["agent"] == "claude"]
+    common = list(max(flags, key=flags.count)) if flags else []
+
+    latest = {}
+    for sid, path in transcript_paths().items():
+        if sid in known or os.path.getmtime(path) < since:
+            continue
+        t = read_transcript(path)
+        if t["entrypoint"] != "cli" or t["prompts"] < 2 or not t["cwd"] or not t["last"]:
+            continue
+        last = parse_utc(t["last"])  # file mtimes get bumped by housekeeping; the last message is real activity
+        if last < since:
+            continue
+        e = {"parked_at": time.strftime("%Y-%m-%d %H:%M", time.localtime(last)), "source": "import",
+             "workspace_id": None, "workspace_label": guess_workspace(t["cwd"], live, labels),
+             "tab_label": (t["title"] or sid[:8])[:30],
+             "agents": [{"agent": "claude", "session_id": sid, "title": t["title"], "cwd": t["cwd"],
+                         "argv": ["claude", *common]}]}
+        k = (t["title"], t["cwd"])  # resumed/forked copies share a title; keep the latest
+        if k not in latest or latest[k]["parked_at"] < e["parked_at"]:
+            latest[k] = e
+    found = sorted(latest.values(), key=lambda e: e["parked_at"])
+    if not found:
+        print("nothing new to import")
+        return
+    for e in found:
+        print(f"  {e['parked_at']}  {e['workspace_label'] or '(focused workspace)'} / {e['agents'][0]['title'] or '?'}")
+    if not confirm(f"import these {len(found)} closed sessions?", "-y" in args):
+        return
+    with store() as entries:
+        have = {key(e) for e in entries}
+        entries.extend(e for e in found if key(e) not in have)
+        entries.sort(key=lambda e: e["parked_at"])
+    print(f"imported {len(found)}")
+
+
+# ---------------------------------------------------------------- search + picker
+
+def index_text(path):
+    """Every title the session has had plus the user's own prompts; assistant output is skipped to stay small."""
+    titles, prompts, size = [], [], 0
+    with open(path, errors="ignore") as fh:
+        for line in fh:
+            if '"type":"user"' not in line and "-title" not in line:
+                continue
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            if d.get("type") in ("custom-title", "ai-title"):
+                v = d.get("customTitle") or d.get("aiTitle")
+                if v and v not in titles:
+                    titles.append(v)
+            elif is_prompt(d) and size < PROMPT_CAP:
+                c = " ".join(d["message"]["content"].split())
+                prompts.append(c)
+                size += len(c)
+    return " | ".join(titles), prompts
+
+
+def load_index(entries, status=None):
+    with locked():
+        idx = read_json(INDEX, {})
+    paths, changed = None, False
+    for e in entries:
+        for a in e["agents"]:
+            sid = a.get("session_id")
+            if a["agent"] != "claude" or not sid:
+                continue
+            paths = transcript_paths() if paths is None else paths
+            path = paths.get(sid)
+            if not path or idx.get(sid, {}).get("mtime") == os.path.getmtime(path):
+                continue
+            if status:
+                status(f"indexing {a.get('title') or sid[:8]}")
+            titles, prompts = index_text(path)
+            idx[sid] = {"mtime": os.path.getmtime(path), "titles": titles, "prompts": prompts}
+            changed = True
+    if changed:
+        with locked():
+            write_json(INDEX, idx)
+    return idx
+
+
+def search(entries, idx, query):
+    """Newest first; every term must match. Title/workspace/path hits rank above hits in your prompts."""
+    terms = query.lower().split()
+    meta_hits, text_hits = [], []
+    for i in sorted(range(len(entries)), key=lambda i: entries[i]["parked_at"], reverse=True):
+        e = entries[i]
+        info = [idx.get(a.get("session_id"), {}) for a in e["agents"]]
+        meta = " ".join([e["parked_at"], e.get("workspace_label") or "", e.get("tab_label") or ""]
+                        + [a.get("title") or "" for a in e["agents"]] + [a.get("cwd") or "" for a in e["agents"]]
+                        + [x.get("titles", "") for x in info]).lower()
+        if all(t in meta for t in terms):
+            meta_hits.append((i, None))
+            continue
+        prompts = [p for x in info for p in x.get("prompts", [])]
+        low = [p.lower() for p in prompts]
+        if all(t in meta or any(t in p for p in low) for t in terms):
+            missing = [t for t in terms if t not in meta]
+            best = max(range(len(low)), key=lambda k: sum(t in low[k] for t in missing))
+            text_hits.append((i, prompts[best]))
+    return meta_hits + text_hits
+
+
+def snippet(text, terms, width):
+    if not text or width <= 0:
+        return ""
+    low = text.lower()
+    at = min((low.find(t) for t in terms if t in low), default=0)
+    start = max(0, at - width // 3)
+    return ("…" if start else "") + text[start:start + width]
+
+
+def picker(entries, query=""):
+    """Type to filter; Enter restores, ctrl-d drops, Esc quits. Returns an index into entries, or None."""
+    import curses
+    result = {"pick": None}
+
+    def run(scr):
+        curses.curs_set(1)
+        curses.use_default_colors()
+        for n, fg in enumerate((curses.COLOR_CYAN, curses.COLOR_YELLOW, 8 if curses.COLORS > 8 else curses.COLOR_WHITE), 1):
+            curses.init_pair(n, fg, -1)
+
+        def status(msg):
+            scr.erase()
+            scr.addnstr(0, 0, msg, scr.getmaxyx()[1] - 1)
+            scr.refresh()
+
+        idx = load_index(entries, status)
+        q, sel, top, dropping = query, 0, 0, False
+        while True:
+            h, w = scr.getmaxyx()
+            rows = search(entries, idx, q)
+            terms = q.lower().split()
+            sel = max(0, min(sel, len(rows) - 1))
+            body = max(1, h - 5)
+            top = min(max(top, sel - body + 1), sel) if rows else 0
+            scr.erase()
+            scr.addnstr(1, 0, f"{len(rows)}/{len(entries)}  enter restore · ↑↓ move · ctrl-d drop · ctrl-u clear · esc quit",
+                        w - 1, curses.color_pair(3))
+            for r, (i, hit) in enumerate(rows[top:top + body]):
+                e = entries[i]
+                mark = "zz" if e.get("hibernated") else "  "
+                title = " | ".join(a.get("title") or a["agent"] for a in e["agents"])
+                line = f"{mark} {e['parked_at']}  {(e.get('workspace_label') or '-')[:12]:<12}  {title}"
+                attr = curses.A_REVERSE if top + r == sel else 0
+                scr.addnstr(2 + r, 0, line.ljust(w - 1), w - 1, attr)
+                if hit and len(line) < w - 10:
+                    scr.addnstr(2 + r, len(line) + 2, "~ " + snippet(hit, terms, w - len(line) - 6),
+                                w - len(line) - 3, attr | curses.color_pair(2))
+            if rows:
+                i, hit = rows[sel]
+                e, a = entries[i], entries[i]["agents"][0]
+                where = "hibernated in its tab" if e.get("hibernated") else f"tab '{e.get('tab_label')}'"
+                scr.addnstr(h - 2, 0, f"{a.get('cwd')}  ·  {(a.get('session_id') or '')[:8]}  ·  {where}  ·  {e.get('source', 'park')}",
+                            w - 1, curses.color_pair(3))
+                if hit:
+                    scr.addnstr(h - 1, 0, snippet(hit, terms, w - 2), w - 1, curses.color_pair(2))
+            prompt = "drop this entry? y/n " if dropping else "restore> "
+            scr.addnstr(0, 0, prompt, w - 1, curses.color_pair(1) | curses.A_BOLD)
+            if not dropping:
+                scr.addnstr(0, len(prompt), q, max(0, w - len(prompt) - 1))
+            scr.move(0, min(w - 1, len(prompt) + (0 if dropping else len(q))))
+            scr.refresh()
+
+            try:
+                k = scr.get_wch()
+            except curses.error:
+                continue
+            except KeyboardInterrupt:
+                return
+            if dropping:
+                dropping = False
+                if k in ("y", "Y") and rows:
+                    gone = entries.pop(rows[sel][0])
+                    with store() as saved:
+                        saved[:] = [x for x in saved if key(x) != key(gone)]
+                continue
+            if k in ("\x1b", "\x03", 27):
+                return
+            if k in ("\n", "\r", curses.KEY_ENTER):
+                result["pick"] = rows[sel][0] if rows else None
+                return
+            if k in (curses.KEY_UP, "\x10"):
+                sel -= 1
+            elif k in (curses.KEY_DOWN, "\x0e"):
+                sel += 1
+            elif k == curses.KEY_PPAGE:
+                sel -= body
+            elif k == curses.KEY_NPAGE:
+                sel += body
+            elif k == "\x04":
+                dropping = bool(rows)
+            elif k in (curses.KEY_BACKSPACE, "\x7f", "\x08"):
+                q, sel = q[:-1], 0
+            elif k == "\x15":
+                q, sel = "", 0
+            elif k == "\x17":
+                q, sel = " ".join(q.split()[:-1]) + (" " if len(q.split()) > 1 else ""), 0
+            elif isinstance(k, str) and k.isprintable():
+                q, sel = q + k, 0
+
+    os.environ.setdefault("ESCDELAY", "25")
+    curses.wrapper(run)
+    return result["pick"]
+
+
+def pick(entries, query):
+    if query.isdigit():
+        i = int(query)
+        if not 1 <= i <= len(entries):
+            raise HerdrError(f"no entry {i}")
+        return i - 1
+    if not sys.stdin.isatty():
+        if not query:
+            raise HerdrError("restore needs a terminal for the picker, or pass N / TEXT")
+        hits = search(entries, load_index(entries), query)
+        if len(hits) != 1:
+            raise HerdrError(f"{len(hits)} entries match '{query}'; be more specific")
+        return hits[0][0]
+    return picker(entries, query)
+
+
+# ---------------------------------------------------------------- list / drop / popups
+
+def fmt(i, e):
+    mark = "zz" if e.get("hibernated") else "  "
+    titles = " | ".join(a.get("title") or a["agent"] for a in e["agents"])
+    return f"{i:>3} {mark} {e['parked_at']}  {e.get('workspace_label') or '?'} / {e.get('tab_label') or '?'}  ->  {titles}"
+
+
+def cmd_list(_args):
+    entries = load()
+    if not entries:
+        print("nothing saved")
+    for i, e in enumerate(entries, 1):
+        print(fmt(i, e))
+
+
+def cmd_drop(args):
+    with store() as entries:
+        if not args or not args[0].isdigit() or not 1 <= int(args[0]) <= len(entries):
+            raise HerdrError("usage: herdr-park drop N")
+        print(f"dropped {fmt(int(args[0]), entries.pop(int(args[0]) - 1))}")
+
+
+def cmd_popup(args):
+    """Plugin action: open one of our popup panes, pinned to the tab the user is looking at."""
+    herdr("plugin", "pane", "open", "--plugin", os.environ.get("HERDR_PLUGIN_ID", PLUGIN_ID), "--entrypoint", args[0],
+          "--env", f"HERDR_PARK_TAB={focused_tab()}")
+
+
+COMMANDS = {
+    "park": cmd_park, "hibernate": cmd_hibernate, "restore": cmd_restore, "list": cmd_list, "ls": cmd_list,
+    "drop": cmd_drop, "import": cmd_import, "wake": cmd_wake, "hook": cmd_hook, "popup": cmd_popup,
+    "park-idle": lambda a: cmd_bulk("park", a), "hibernate-idle": lambda a: cmd_bulk("hibernate", a),
+}
+
+
+def main():
+    argv = sys.argv[1:]
+    popup = "--popup" in argv
+    argv = [a for a in argv if a != "--popup"]
+    if not argv or argv[0] not in COMMANDS:
+        print(__doc__.strip())
+        sys.exit(0 if not argv else 2)
+    if os.environ.get("HERDR_ENV") != "1" and argv[0] not in ("list", "ls", "drop"):
+        sys.exit("herdr-park talks to the running herdr session; run it inside herdr")
+    try:
+        COMMANDS[argv[0]](argv[1:])
+    except KeyboardInterrupt:
+        pass
+    except Exception as exc:  # noqa: BLE001 - popups and hooks close on exit, so every failure is logged
+        import traceback
+        msg = str(exc) if isinstance(exc, HerdrError) else traceback.format_exc()
+        with contextlib.suppress(OSError):
+            ensure_state()
+            with open(ERROR_LOG, "a") as f:
+                f.write(f"{now()} {' '.join(argv)}\n{msg}\n")
+        if popup:
+            print(f"\nherdr-park: {msg}\n\npress enter to close")
+            with contextlib.suppress(EOFError, KeyboardInterrupt):
+                input()
+        elif argv[0] in ("hibernate", "popup"):
+            notify("herdr-park", msg[:200])
+        else:
+            print(f"herdr-park: {msg}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
