@@ -18,7 +18,7 @@ Tabs you close any other way are saved automatically, so an accidental close is 
 herdr plugin install prabhatgmp/herdr-park
 ```
 
-Requires herdr 0.9.1 or newer, Python 3.9+ and macOS or Linux. herdr's Claude integration must be installed (`herdr integration install claude`), because that's how herdr learns each pane's session ID.
+Requires herdr 0.7.5 or newer, Python 3.9+ and macOS or Linux. herdr's Claude integration must be installed (`herdr integration install claude`), because that's how herdr learns each pane's session ID.
 
 Bind the actions in `~/.config/herdr/config.toml`, then run `herdr server reload-config`:
 

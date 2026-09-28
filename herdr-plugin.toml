@@ -1,7 +1,7 @@
 id = "herdr-park"
 name = "Park"
 version = "0.1.0"
-min_herdr_version = "0.9.1"
+min_herdr_version = "0.7.5"
 description = "Free the memory of idle agent tabs: park (close + save) or hibernate (keep the tab) and resume the exact session later from a searchable picker"
 platforms = ["linux", "macos"]
 
