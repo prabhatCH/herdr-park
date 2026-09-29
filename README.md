@@ -15,7 +15,7 @@ Tabs you close any other way are saved automatically, so an accidental close is 
 ## Install
 
 ```bash
-herdr plugin install prabhatgmp/herdr-park
+herdr plugin install prabhatCH/herdr-park
 ```
 
 Requires herdr 0.9.0 or newer, Python 3.9+ and macOS or Linux. herdr's Claude integration must be installed (`herdr integration install claude`), because that's how herdr learns each pane's session ID.
