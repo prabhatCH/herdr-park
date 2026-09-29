@@ -75,7 +75,7 @@ herdr-park import [-y]               add Claude sessions from tabs closed before
 ## How it works
 
 - **Park and hibernate** refuse a tab whose agent is working or waiting on an approval, and a tab whose session has no transcript yet (nothing to resume). They save the entry before closing the tab or stopping the agent, so a failure never loses a session.
-- **Hibernate** sends SIGTERM to the agent. Claude Code exits and takes its MCP servers with it. The pane is left running a small wait-for-Enter stub, which then execs the agent back into its session.
+- **Hibernate** sends SIGTERM to the agent. Claude Code exits and takes its MCP servers with it. The plugin waits until herdr has noticed the exit (about 2 seconds), claims the pane, and only then starts a small wait-for-Enter stub, which later execs the agent back into its session. The order matters: with the stub already running, herdr can take 20 seconds or more to notice the exit, and it ignores a claim made before then.
 - **The hibernated badge:** herdr drops a pane's agent row when the agent exits. So the plugin claims the pane with `pane report-agent` (source `custom:herdr-park`, agent `hibernated`, state `unknown`, which renders as `·`), and relabels it with `pane report-metadata`. The claim is released before the agent starts again, because a stale claim outranks herdr's own detection. As a safety net, if a claimed pane is found running something other than the stub or a shell, the claim is dropped.
 - **Automatic capture:** herdr's `tab.closed` event carries only IDs. So the plugin keeps a snapshot of every agent pane (session, cwd, title, labels, launch flags), refreshed on agent detection, status changes and tab renames. When a tab or pane closes, its snapshot is saved as a parked entry.
 - **Multiple herdr sessions** share one list of saved tabs but keep separate snapshots, since pane and tab IDs repeat across sessions.
@@ -89,7 +89,7 @@ herdr-park import [-y]               add Claude sessions from tabs closed before
 
 ## Limits
 
-- Claude Code is fully supported. Codex restores with `codex resume <id>`. Other agents are saved, but restore only prints their session ID.
+- Claude Code is fully supported. Codex restores with `codex resume <id>`. herdr doesn't report a session ID for a brand-new Codex session, so the plugin finds it from Codex's session files (`$CODEX_HOME/sessions`): the one started in the pane's folder after the Codex process. It uses the ID only when exactly one file matches, then reports it to herdr. Other agents are saved, but restore only prints their session ID.
 - Plain shell panes in a parked tab aren't restored.
 - It depends on field names in herdr's CLI output (`agent_session`, `terminal_title_stripped`, `foreground_cwd`) and on Claude Code's transcript format. Tested with herdr 0.9.1 and Claude Code 2.1.
 

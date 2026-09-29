@@ -172,17 +172,41 @@ def agent_process(pane_id, kind):
     return None, [kind]
 
 
+def agent_rows():
+    """herdr can list a pane with no agent label while it settles an exited agent; skip those rows."""
+    return [a for a in herdr("agent", "list")["agents"] if a.get("agent")]
+
+
 def real_agents():
     """Agents herdr detected, without the placeholder rows we hold for hibernated panes."""
-    return [a for a in herdr("agent", "list")["agents"] if a["agent"] != CLAIM_AGENT]
+    return [a for a in agent_rows() if a["agent"] != CLAIM_AGENT]
 
 
 def claim(pane_id, kind):
-    """Keep a hibernated pane in the sidebar with its own label and the unknown-state glyph."""
+    """Keep a hibernated pane in the sidebar with its own label and the unknown-state glyph. True if herdr took it.
+
+    herdr silently ignores the claim while it still holds the exited agent's session for the pane, and once it
+    has moved into that state it keeps ignoring it, so callers must wait_for_agent_drop() first.
+    """
     with contextlib.suppress(HerdrError):
         herdr("pane", "report-agent", pane_id, "--source", CLAIM_SOURCE, "--agent", CLAIM_AGENT, "--state", "unknown")
         herdr("pane", "report-metadata", pane_id, "--source", META_SOURCE, "--display-agent", f"{kind} · hibernated",
               "--state-label", "unknown=hibernated")
+        return herdr("pane", "get", pane_id)["pane"].get("agent") == CLAIM_AGENT
+    return False
+
+
+def wait_for_agent_drop(pane_id, kind, timeout=15):
+    """Until herdr notices the agent exited. With only the shell in the foreground this takes about 2s; start
+    anything else first (the wake stub) and it can take 20s+, which is what used to lose the sidebar row."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        with contextlib.suppress(HerdrError):
+            pane = herdr("pane", "get", pane_id)["pane"]
+            if pane.get("agent") != kind and (pane.get("agent_session") or {}).get("agent") != kind:
+                return True
+        time.sleep(0.5)
+    return False
 
 
 def release(pane_id):
@@ -192,6 +216,59 @@ def release(pane_id):
     with contextlib.suppress(HerdrError):
         herdr("pane", "release-agent", pane_id, "--source", CLAIM_SOURCE, "--agent", CLAIM_AGENT)
         herdr("pane", "report-metadata", pane_id, "--source", META_SOURCE, "--clear-display-agent", "--clear-state-labels")
+
+
+def codex_home():
+    return os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+
+
+def process_started_at(pid):
+    out = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
+    with contextlib.suppress(ValueError):
+        return time.mktime(time.strptime(" ".join(out.split()), "%a %b %d %H:%M:%S %Y"))
+    return None
+
+
+def find_codex_session(a, taken):
+    """The rollout file this Codex pane is writing, found by folder and start time; None unless exactly one fits.
+
+    Codex keeps every open rollout inside one shared app-server, so open files can't map pane -> session.
+    """
+    proc, _ = agent_process(a["pane_id"], "codex")
+    started = proc and process_started_at(proc["pid"])
+    cwd = a.get("foreground_cwd") or a.get("cwd")
+    if not started or not cwd:
+        return None
+    days = {time.strftime("%Y/%m/%d", f(t)) for t in (time.time(), time.time() - 86400) for f in (time.localtime, time.gmtime)}
+    matches = set()
+    for day in days:
+        for path in glob.glob(os.path.join(codex_home(), "sessions", day, "rollout-*.jsonl")):
+            with contextlib.suppress(OSError, ValueError, KeyError, TypeError):
+                with open(path) as f:
+                    meta = json.loads(f.readline())
+                payload = meta["payload"] if meta.get("type") == "session_meta" else {}
+                sid, when = payload.get("id"), payload.get("timestamp") or meta.get("timestamp")
+                if (sid and sid not in taken and when and os.path.realpath(payload.get("cwd") or "") == os.path.realpath(cwd)
+                        and parse_utc(when) >= started - 5):
+                    matches.add(sid)
+    return matches.pop() if len(matches) == 1 else None
+
+
+def fill_codex_sessions(agents, everyone=None):
+    """Give session-less Codex rows the id of their rollout, and tell herdr so its own restore works too."""
+    taken = {(a.get("agent_session") or {}).get("value") for a in (everyone if everyone is not None else agents)}
+    for a in agents:
+        if a.get("agent") != "codex" or (a.get("agent_session") or {}).get("value"):
+            continue
+        sid = find_codex_session(a, taken)
+        if not sid:
+            continue
+        taken.add(sid)
+        a["agent_session"] = {"source": "herdr:codex", "agent": "codex", "kind": "id", "value": sid}
+        with contextlib.suppress(HerdrError):
+            herdr("pane", "report-agent-session", a["pane_id"], "--source", "herdr:codex", "--agent", "codex",
+                  "--agent-session-id", sid)
+    return agents
 
 
 def transcript_paths():
@@ -254,6 +331,8 @@ def new_entry(ws_id, ws_label, tab_label, agents, source, **extra):
 def check_tab(tab_id, action, force=False):
     """Return (tab, ws, agents, note) for a tab that is safe to park/hibernate, or raise with the reason."""
     tab, ws, agents, panes = describe(tab_id)
+    if any(a["agent"] == "codex" for a in agents):
+        fill_codex_sessions(agents, real_agents())
     name = f"{ws.get('label')} / {tab.get('label')}"
     if not agents:
         raise HerdrError(f"{name}: no agent in this tab")
@@ -309,13 +388,15 @@ def hibernate_tab(tab_id, force=False):
             continue
         freed += rss_mb(r["pane_id"])
         os.kill(proc["pid"], signal.SIGTERM)
+    kept = 0
     for r in records:
         wait_for_shell(r["pane_id"])
+        wait_for_agent_drop(r["pane_id"], r["agent"])
+        kept += claim(r["pane_id"], r["agent"])  # before the stub starts; see wait_for_agent_drop
         herdr("pane", "run", r["pane_id"], shlex.join([SELF, "wake", r["session_id"]]))
-        claim(r["pane_id"], r["agent"])
     if not label.startswith(ASLEEP):
         herdr("tab", "rename", tab_id, ASLEEP + label)
-    return name, freed
+    return name, freed, kept == len(records)
 
 
 def wait_for_shell(pane_id, timeout=15):
@@ -334,8 +415,9 @@ def cmd_park(args):
 
 def cmd_hibernate(args):
     pos = [a for a in args if not a.startswith("-")]
-    name, freed = hibernate_tab(pos[0] if pos else focused_tab(), "--force" in args)
-    notify(f"hibernated {name}", f"freed ~{freed} MB; press Enter in the tab to resume" if freed else "")
+    name, freed, badge = hibernate_tab(pos[0] if pos else focused_tab(), "--force" in args)
+    body = f"freed ~{freed} MB; press Enter in the tab to resume" if freed else "press Enter in the tab to resume"
+    notify(f"hibernated {name}", body + ("" if badge else " (herdr didn't keep its sidebar row)"))
 
 
 def idle_tabs():
@@ -361,7 +443,7 @@ def cmd_bulk(action, args):
             if action == "park":
                 park_tab(t, assume_yes=True)
             else:
-                name, mb = hibernate_tab(t)
+                name, mb, _ = hibernate_tab(t)
                 freed += mb
                 print(f"hibernated {name} (~{mb} MB)")
         except HerdrError as e:
@@ -502,11 +584,11 @@ def cmd_restore(args):
 
 def refresh_live():
     """Snapshot every agent pane with a session, so a later tab.closed (which carries only ids) can be saved."""
-    everything = herdr("agent", "list")["agents"]
+    everything = agent_rows()
     for a in everything:
         if a["agent"] == CLAIM_AGENT and not stub_or_shell(a["pane_id"]):
             release(a["pane_id"])  # the agent came back without the wake stub; don't hide it
-    agents = [a for a in everything if a["agent"] != CLAIM_AGENT]
+    agents = fill_codex_sessions([a for a in everything if a["agent"] != CLAIM_AGENT])
     ws = {w["workspace_id"]: w.get("label") for w in herdr("workspace", "list")["workspaces"]}
     tabs = {t["tab_id"]: t.get("label") for t in herdr("tab", "list")["tabs"]}
     t = time.time()
