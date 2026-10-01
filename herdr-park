@@ -41,6 +41,10 @@ SELF = os.path.realpath(__file__)
 
 BUSY = {"working", "blocked"}
 SHELLS = {"zsh", "bash", "fish", "sh", "dash", "ksh", "nu", "tcsh", "elvish", "xonsh"}
+# agent binaries herdr knows (`herdr agent` kinds); a claimed pane running one of these has woken without the stub
+AGENT_BINARIES = {"claude", "codex", "gemini", "cursor-agent", "devin", "agy", "cline", "omp", "mastracode", "opencode",
+                  "copilot", "kimi", "kiro", "kiro-cli", "droid", "amp", "grok", "hermes", "kilo", "qodercli", "qwen",
+                  "letta", "maki", "muse", "pi"}
 ASLEEP = "zz "
 CLAIM_SOURCE = "custom:herdr-park"   # holds a hibernated pane in the sidebar as agent "hibernated", state unknown (·)
 CLAIM_AGENT = "hibernated"
@@ -514,9 +518,13 @@ def is_stub(procs):
     return any("herdr-park" in c and " wake " in f" {c} " for c in (" ".join(p.get("argv") or [p.get("argv0") or ""]) for p in procs))
 
 
-def stub_or_shell(pane_id):
+def agent_running(pane_id):
+    """An agent binary is in the foreground. Checked positively: right after an agent exits, the shell prompt
+    can briefly run helpers (git status and the like), and treating those as "woke up" dropped the claim."""
     procs = foreground(pane_id).get("foreground_processes", [])
-    return is_stub(procs) or is_shell(procs)
+    names = {os.path.basename(p.get("argv0") or "").lstrip("-") for p in procs}
+    names |= {os.path.basename((p.get("argv") or [""])[0]).lstrip("-") for p in procs}
+    return not is_stub(procs) and bool(names & AGENT_BINARIES)
 
 
 def wake_in_place(e, focus):
@@ -592,7 +600,7 @@ def refresh_live(reset=False):
     """
     everything = agent_rows()
     for a in everything:
-        if a["agent"] == CLAIM_AGENT and not stub_or_shell(a["pane_id"]):
+        if a["agent"] == CLAIM_AGENT and agent_running(a["pane_id"]):
             release(a["pane_id"])  # the agent came back without the wake stub; don't hide it
     agents = fill_codex_sessions([a for a in everything if a["agent"] != CLAIM_AGENT])
     ws = {w["workspace_id"]: w.get("label") for w in herdr("workspace", "list")["workspaces"]}
