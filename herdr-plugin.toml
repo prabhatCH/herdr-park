@@ -5,10 +5,11 @@ min_herdr_version = "0.9.0"
 description = "Free the memory of idle agent tabs: park (close + save) or hibernate (keep the tab) and resume the exact session later from a searchable picker"
 platforms = ["linux", "macos"]
 
-# Keep a snapshot of every agent tab so tabs closed by hand are saved too
-# (tab.closed only carries ids, so the details have to be captured earlier).
+# Keep a snapshot of every agent tab so tabs closed by hand are saved too. herdr only sends
+# tab.closed / pane.closed for closes made through its API, and they carry only ids, so the
+# refresh hook also saves any snapshot pane that no longer exists.
 [[startup]]
-command = ["./herdr-park", "hook", "refresh"]
+command = ["./herdr-park", "hook", "startup"]
 
 [[events]]
 on = "pane.agent_detected"

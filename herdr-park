@@ -45,7 +45,7 @@ ASLEEP = "zz "
 CLAIM_SOURCE = "custom:herdr-park"   # holds a hibernated pane in the sidebar as agent "hibernated", state unknown (·)
 CLAIM_AGENT = "hibernated"
 META_SOURCE = "herdr-park"
-GONE_TTL = 600          # keep closed panes in the live snapshot this long, so a late tab.closed still finds them
+GONE_TTL = 600          # keep panes whose agent exited this long, so a later close of their tab still saves them
 PROMPT_CAP = 40000      # per-session prompt text kept in the search index
 
 
@@ -380,7 +380,8 @@ def hibernate_tab(tab_id, force=False):
     with store() as entries:
         entries[:] = [e for e in entries if key(e) != records[0]["session_id"]]
         entries.append(new_entry(ws["workspace_id"], ws.get("label"), label, records, "hibernate",
-                                 hibernated={"tab_id": tab_id, "pane_ids": [r["pane_id"] for r in records]}))
+                                 hibernated={"tab_id": tab_id, "pane_ids": [r["pane_id"] for r in records],
+                                             "session": SESSION}))
     freed = 0
     for r in records:
         proc, _ = agent_process(r["pane_id"], r["agent"])
@@ -582,8 +583,13 @@ def cmd_restore(args):
 
 # ---------------------------------------------------------------- automatic capture (event hooks)
 
-def refresh_live():
-    """Snapshot every agent pane with a session, so a later tab.closed (which carries only ids) can be saved."""
+def refresh_live(reset=False):
+    """Snapshot every agent pane with a session, and save the ones whose pane has disappeared since.
+
+    herdr only emits tab.closed / pane.closed for closes made through its API; closing with a keybinding
+    (prefix+shift+x, prefix+x) emits nothing. So a pane that was in the snapshot and no longer exists is
+    treated as closed here. This runs on every agent status change, so it notices within moments.
+    """
     everything = agent_rows()
     for a in everything:
         if a["agent"] == CLAIM_AGENT and not stub_or_shell(a["pane_id"]):
@@ -591,10 +597,11 @@ def refresh_live():
     agents = fill_codex_sessions([a for a in everything if a["agent"] != CLAIM_AGENT])
     ws = {w["workspace_id"]: w.get("label") for w in herdr("workspace", "list")["workspaces"]}
     tabs = {t["tab_id"]: t.get("label") for t in herdr("tab", "list")["tabs"]}
+    panes = {p["pane_id"] for p in herdr("pane", "list")["panes"]}
     t = time.time()
     with locked():
-        live = read_json(LIVE, {})
-        seen = set()
+        live = {} if reset else read_json(LIVE, {})  # after a server restart pane ids can differ: start over
+        seen, live_sids = set(), set()
         for a in agents:
             sid = (a.get("agent_session") or {}).get("value")
             if not sid:
@@ -606,8 +613,11 @@ def refresh_live():
                        tab_label=tabs.get(a["tab_id"]), seen_at=t)
             live[a["pane_id"]] = rec
             seen.add(a["pane_id"])
+            live_sids.add(sid)
+        closed = [r for p, r in live.items() if p not in seen and p not in panes]
+        save_closed(live, closed, lambda h: not any(p in panes for p in h["pane_ids"]), live_sids)
         for pane_id, rec in list(live.items()):
-            if pane_id not in seen:
+            if pane_id not in seen:  # pane still there, agent exited: keep a while in case the tab closes next
                 rec.setdefault("gone_at", t)
                 if t - rec["gone_at"] > GONE_TTL:
                     del live[pane_id]
@@ -617,35 +627,46 @@ def refresh_live():
                 os.remove(other)  # snapshot of a herdr session that no longer runs
 
 
+def save_closed(live, recs, hibernated_gone, open_sids=()):
+    """Inside locked(): turn closed panes' snapshots into saved entries (one per tab), and mark hibernated
+    entries whose tab is gone as plain saved ones. Skips sessions already saved or open in another pane."""
+    for r in recs:
+        live.pop(r["pane_id"], None)
+    entries = read_json(PARKED, [])
+    for e in entries:
+        h = e.get("hibernated")
+        if h and h.get("session", SESSION) == SESSION and hibernated_gone(h):
+            e.pop("hibernated")
+            e["tab_label"] = (e.get("tab_label") or "").removeprefix(ASLEEP)
+            e["parked_at"], e["source"] = now(), "auto"
+    known = {a.get("session_id") for e in entries for a in e["agents"]} | set(open_sids)
+    paths = transcript_paths() if recs else {}
+    by_tab = {}
+    for r in recs:
+        if r["session_id"] not in known and resumable(r, paths):
+            by_tab.setdefault(r.get("tab_id"), []).append(r)
+            known.add(r["session_id"])
+    fields = ("agent", "session_id", "title", "cwd", "argv", "pane_id")
+    for tab_recs in by_tab.values():
+        first = tab_recs[0]
+        entries.append(new_entry(first["workspace_id"], first["workspace_label"], first["tab_label"],
+                                 [{k: r.get(k) for k in fields} for r in tab_recs], "auto"))
+    write_json(PARKED, entries)
+
+
 def capture(match):
-    """Save the live-snapshot panes that `match` selects; convert a hibernated entry whose tab just closed."""
+    """Close events from herdr's API: save the snapshot panes that `match` selects."""
     with locked():
         live = read_json(LIVE, {})
         recs = [r for p, r in live.items() if match(p, r)]
-        for r in recs:
-            live.pop(r["pane_id"], None)
+        save_closed(live, recs, lambda h: any(match(p, {"tab_id": h["tab_id"], "pane_id": p}) for p in h["pane_ids"]))
         write_json(LIVE, live)
-        entries = read_json(PARKED, [])
-        for e in entries:
-            h = e.get("hibernated")
-            if h and any(match(p, {"tab_id": h["tab_id"], "pane_id": p}) for p in h["pane_ids"]):
-                e.pop("hibernated")
-                e["tab_label"] = (e.get("tab_label") or "").removeprefix(ASLEEP)
-                e["parked_at"], e["source"] = now(), "auto"
-        known = {a.get("session_id") for e in entries for a in e["agents"]}
-        paths = transcript_paths()
-        keep = [r for r in recs if r["session_id"] not in known and resumable(r, paths)]
-        if keep:
-            fields = ("agent", "session_id", "title", "cwd", "argv", "pane_id")
-            entries.append(new_entry(keep[0]["workspace_id"], keep[0]["workspace_label"], keep[0]["tab_label"],
-                                     [{k: r.get(k) for k in fields} for r in keep], "auto"))
-        write_json(PARKED, entries)
 
 
 def cmd_hook(args):
     event = json.loads(os.environ.get("HERDR_PLUGIN_EVENT_JSON") or "{}").get("data", {})
-    if args[0] == "refresh":
-        refresh_live()
+    if args[0] in ("refresh", "startup"):
+        refresh_live(reset=args[0] == "startup")
     elif args[0] == "tab-closed" and event.get("tab_id"):
         capture(lambda pane_id, r: r.get("tab_id") == event["tab_id"])
     elif args[0] == "pane-closed" and event.get("pane_id"):
