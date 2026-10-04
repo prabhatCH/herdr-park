@@ -2,6 +2,10 @@
 
 A [herdr](https://herdr.dev) plugin that frees the memory held by idle agent tabs without losing their sessions.
 
+![herdr-park hibernating three idle Claude Code tabs, freeing their memory, and resuming one from the picker](docs/demo.gif)
+
+*In the demo, three idle Claude Code tabs hold about 0.75 GB. `herdr-park hibernate-idle` frees ~783 MB, the sidebar keeps a row for each, and the picker brings one back exactly where it left off. ([MP4](docs/demo.mp4) · how it's recorded: [`demo/`](demo/))*
+
 An idle Claude Code tab still holds the `claude` process and every MCP server it started: typically 500 MB to 1 GB per tab. With 15 to 20 tabs open that adds up to gigabytes spent on tabs you aren't using. Closing them frees the memory, but then finding the right session again is hard.
 
 herdr-park gives you three things:
