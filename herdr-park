@@ -457,9 +457,25 @@ def cmd_bulk(action, args):
         notify(f"hibernated {len(tabs)} tabs", f"freed ~{freed} MB")
 
 
+# Mouse reporting (every mode and encoding), focus events, bracketed paste, the kitty keyboard
+# protocol's pushed flags, and a hidden cursor.
+TERMINAL_RESET = "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1004l\x1b[?2004l\x1b[<99u\x1b[?25h"
+
+
+def reset_terminal():
+    """Undo what a killed full-screen agent left on. Codex doesn't restore the terminal on SIGTERM, so the tty
+    stays raw (Enter sends \\r, which input() never sees as a line end) and mouse reports flood the prompt."""
+    if not sys.stdin.isatty():
+        return
+    subprocess.run(["stty", "sane"], stdin=sys.stdin, check=False)
+    sys.stdout.write(TERMINAL_RESET)
+    sys.stdout.flush()
+
+
 def cmd_wake(args):
     """Runs inside a hibernated pane: wait for Enter, then exec the agent back into its session."""
     sid = args[0]
+    reset_terminal()
     entry = next((e for e in load() if key(e) == sid), None)
     agent = next((a for e in ([entry] if entry else []) for a in e["agents"] if a["session_id"] == sid), None)
     title = (agent or {}).get("title") or sid[:8]
