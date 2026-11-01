@@ -89,7 +89,7 @@ herdr-park import [-y]               add Claude sessions from tabs closed before
 
 ## Limits
 
-- Claude Code is fully supported. Codex restores with `codex resume <id>`. herdr doesn't report a session ID for a brand-new Codex session, so the plugin finds it from Codex's session files (`$CODEX_HOME/sessions`): the one started in the pane's folder after the Codex process. It uses the ID only when exactly one file matches, then reports it to herdr. Other agents are saved, but restore only prints their session ID.
+- Claude Code is fully supported. Codex restores with `codex resume <id>`. When herdr doesn't report a Codex session ID (a brand-new session, or one picked with plain `codex resume`), the plugin finds it from Codex's session files (`$CODEX_HOME/sessions`): an interactive session in the pane's folder whose file has been written since the Codex process started. A resumed session keeps writing to its original, possibly weeks-old file, and Codex's auto-reviewer writes session files of its own that can't be resumed, so those are skipped. It uses the ID only when exactly one file matches, then reports it to herdr. Other agents are saved, but restore only prints their session ID.
 - Plain shell panes in a parked tab aren't restored.
 - It depends on field names in herdr's CLI output (`agent_session`, `terminal_title_stripped`, `foreground_cwd`) and on Claude Code's transcript format. Tested with herdr 0.9.1 and Claude Code 2.1.
 

@@ -222,6 +222,9 @@ def release(pane_id):
         herdr("pane", "report-metadata", pane_id, "--source", META_SOURCE, "--clear-display-agent", "--clear-state-labels")
 
 
+INTERACTIVE_CODEX = ("cli", "vscode")
+
+
 def codex_home():
     return os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
 
@@ -234,27 +237,30 @@ def process_started_at(pid):
 
 
 def find_codex_session(a, taken):
-    """The rollout file this Codex pane is writing, found by folder and start time; None unless exactly one fits.
+    """The rollout file this Codex pane is writing, found by folder and time; None unless exactly one fits.
 
     Codex keeps every open rollout inside one shared app-server, so open files can't map pane -> session.
+    A resumed session keeps writing to its original rollout, which can be weeks old, so files count if they were
+    written since the codex process started, not only if they started then. Codex's auto-reviewer ("guardian") and
+    sub-agents write rollouts of their own in the same folder; only interactive ones (source cli or vscode) count.
     """
     proc, _ = agent_process(a["pane_id"], "codex")
     started = proc and process_started_at(proc["pid"])
     cwd = a.get("foreground_cwd") or a.get("cwd")
     if not started or not cwd:
         return None
-    days = {time.strftime("%Y/%m/%d", f(t)) for t in (time.time(), time.time() - 86400) for f in (time.localtime, time.gmtime)}
     matches = set()
-    for day in days:
-        for path in glob.glob(os.path.join(codex_home(), "sessions", day, "rollout-*.jsonl")):
-            with contextlib.suppress(OSError, ValueError, KeyError, TypeError):
-                with open(path) as f:
-                    meta = json.loads(f.readline())
-                payload = meta["payload"] if meta.get("type") == "session_meta" else {}
-                sid, when = payload.get("id"), payload.get("timestamp") or meta.get("timestamp")
-                if (sid and sid not in taken and when and os.path.realpath(payload.get("cwd") or "") == os.path.realpath(cwd)
-                        and parse_utc(when) >= started - 5):
-                    matches.add(sid)
+    for path in glob.glob(os.path.join(codex_home(), "sessions", "*", "*", "*", "rollout-*.jsonl")):
+        with contextlib.suppress(OSError, ValueError, KeyError, TypeError):
+            if os.path.getmtime(path) < started - 5:
+                continue
+            with open(path) as f:
+                meta = json.loads(f.readline())
+            payload = meta["payload"] if meta.get("type") == "session_meta" else {}
+            sid = payload.get("id")
+            if (sid and sid not in taken and payload.get("source") in INTERACTIVE_CODEX
+                    and os.path.realpath(payload.get("cwd") or "") == os.path.realpath(cwd)):
+                matches.add(sid)
     return matches.pop() if len(matches) == 1 else None
 
 
