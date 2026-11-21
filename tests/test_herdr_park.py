@@ -30,6 +30,24 @@ def test_harness_keeps_everything_inside_the_tmp_dir(harness, park, tmp_path):
     assert park.SELF == os.path.realpath(str(Path(park.__file__)))
 
 
+@pytest.mark.parametrize("module, name", [("os", "killpg"), ("os", "system"), ("os", "posix_spawn"), ("os", "execv"),
+                                          ("os", "fork"), ("os", "_exit"), ("signal", "raise_signal")])
+def test_the_script_cannot_reach_a_real_process_call_the_tests_do_not_fake(park, module, name):
+    with pytest.raises(AssertionError, match="which the tests do not fake"):
+        getattr(getattr(park, module), name)
+    assert park.os.kill.__self__ is not None and park.os.path.join("a", "b") == "a/b"   # faked or harmless names still work
+    assert park.signal.SIGTERM == signal.SIGTERM
+
+
+def test_unknown_pids_and_ps_fields_are_recorded_for_the_fixture_even_if_main_swallows_the_error(harness, fake):
+    with pytest.raises(AssertionError):
+        fake.kill(1, signal.SIGTERM)
+    with pytest.raises(AssertionError):
+        fake.run(["ps", "-o", "comm=", "-p", "1"])
+    assert fake.unexpected == [("kill", 1, signal.SIGTERM), ["ps", "comm="]]
+    fake.unexpected.clear()   # expected here, so the fixture's teardown check must not fire
+
+
 # ---------------------------------------------------------------- resume recipe
 
 @pytest.mark.parametrize("agent, expected", [

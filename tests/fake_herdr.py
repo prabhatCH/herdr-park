@@ -137,6 +137,7 @@ class FakeHerdr:
         """Stand-in for os.kill. Only pids the fake created are accepted; SIGTERM stops an agent."""
         self.signals.append((pid, sig))
         if pid not in self._pids:
+            self.unexpected.append(("kill", pid, sig))
             raise AssertionError(f"herdr-park signalled pid {pid}, which is not one the fake created")
         if sig != signal.SIGTERM:
             return
@@ -158,6 +159,7 @@ class FakeHerdr:
         elif field == "lstart=":
             out = time.strftime("%a %b %d %H:%M:%S %Y", time.localtime(time.time() - 3600)) + "\n"
         else:
+            self.unexpected.append(["ps", field])
             raise AssertionError(f"herdr-park ran ps with fields the fake does not know: {field}")
         return subprocess.CompletedProcess(["ps"], 0, out, "")
 

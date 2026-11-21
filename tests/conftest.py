@@ -11,6 +11,8 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
+import signal
 import sys
 import types
 from pathlib import Path
@@ -29,14 +31,28 @@ CLEARED_ENV = ("HERDR_PLUGIN_CONTEXT_JSON", "HERDR_PLUGIN_EVENT_JSON", "HERDR_PA
                "HERDR_ACTIVE_PANE_ID", "HERDR_PARK_TAB", "HERDR_PLUGIN_ID", "XDG_STATE_HOME")
 
 
+# Names that start, signal or replace a process. A proxied module refuses them unless a test overrode them
+# explicitly, so a new `os.killpg(...)` or `os.system(...)` in the script fails loudly instead of running for real.
+DANGEROUS = re.compile(r"^(kill|killpg|exec.*|spawn.*|posix_spawn.*|system|popen|fork.*|_exit|abort|"
+                       r"raise_signal|pthread_kill|pidfd_send_signal|alarm|setitimer|signal|startfile)$")
+
+
 class Proxy:
-    """The real module, except for the named attributes. Used so a patched os/time/subprocess stays inside the script."""
+    """The real module, except for the named attributes. Used so a patched os/time/subprocess stays inside the script.
+
+    Fails closed: a process-level call that was not overridden raises instead of falling through to the real module.
+    """
 
     def __init__(self, real: Any, **overrides: Any) -> None:
         self._real, self._overrides = real, overrides
 
     def __getattr__(self, name: str) -> Any:
-        return self._overrides[name] if name in self._overrides else getattr(self._real, name)
+        if name in self._overrides:
+            return self._overrides[name]
+        if DANGEROUS.match(name):
+            raise AssertionError(f"herdr-park used {self._real.__name__}.{name}, which the tests do not fake; "
+                                 f"teach the harness about it in tests/conftest.py")
+        return getattr(self._real, name)
 
 
 class Clock:
@@ -86,6 +102,7 @@ class Harness:
         self.clock = Clock()
         park.subprocess = SimpleNamespace(run=self.fake.run)
         park.os = Proxy(os, kill=self.fake.kill, execvp=self.fake.execvp)
+        park.signal = Proxy(signal)   # the script only reads constants such as SIGTERM from it
         park.time = Proxy(__import__("time"), time=self.clock.time, sleep=self.clock.sleep)
 
         self.stdin("")   # never read a real terminal, even under `pytest -s`
