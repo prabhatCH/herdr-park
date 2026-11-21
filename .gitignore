@@ -10,3 +10,7 @@ error.log
 demo/.state-aside/
 demo/zdotdir/
 demo/frame-*.png
+
+# tests
+.pytest_cache/
+.venv/

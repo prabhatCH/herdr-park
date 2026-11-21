@@ -97,6 +97,17 @@ herdr-park import [-y]               add Claude sessions from tabs closed before
 - Plain shell panes in a parked tab aren't restored.
 - It depends on field names in herdr's CLI output (`agent_session`, `terminal_title_stripped`, `foreground_cwd`) and on Claude Code's transcript format. Tested with herdr 0.9.1 and Claude Code 2.1.
 
+## Running the tests
+
+The tests run `herdr-park` against a small fake herdr (`tests/fake_herdr.py`), so they need no herdr, no Claude Code and no network. They never signal a real process, never read `~/.claude`, and keep all state in pytest's temporary directory.
+
+```bash
+python3 -m pip install pytest   # or: uv run --with pytest pytest
+python3 -m pytest
+```
+
+They run on Python 3.9 and newer, on macOS and Linux. The script is loaded as-is, so there is nothing to build first. To test a new behavior, build the world you need with the helpers in `tests/conftest.py` (`harness.session(...)`, `fake.add_agent(...)`) and drive it with `harness.cli("park", ...)`. If the plugin starts calling a herdr command the fake doesn't know, the test fails and says which; teach the fake that command in `tests/fake_herdr.py`.
+
 ## License
 
 MIT
